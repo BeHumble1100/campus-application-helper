@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         秋招网申资料库 v3.4.6
+// @name         秋招网申资料库 v3.5.1
 // @namespace    campus-application-helper
-// @version      3.4.6
-// @description  分类/卡片/字段三级自定义；支持 Ctrl/Cmd+Z 撤回、记住上次卡片与滚动位置；可移动、缩放、拖拽排序、JSON 导入导出。
+// @version      3.5.1
+// @description  分类/卡片/字段三级自定义；侧栏也可拖动；编辑已有内容自动保存；支持 Ctrl/Cmd+Z 撤回、记住浏览位置、移动缩放、拖拽排序、JSON 导入导出。
 // @match        http://*/*
 // @match        https://*/*
 // @run-at       document-end
@@ -15,10 +15,12 @@
 (function () {
   'use strict';
 
-  const ROOT = 'campus-helper-v346';
+  const ROOT = 'campus-helper-v351';
   const DB_KEY = 'campus-helper-v32-db';
-  const UI_KEY = 'campus-helper-v346-ui';
+  const UI_KEY = 'campus-helper-v351-ui';
   const OLD_UI_KEYS = [
+    'campus-helper-v350-ui',
+    'campus-helper-v346-ui',
     'campus-helper-v345-ui',
     'campus-helper-v344-ui',
     'campus-helper-v343-ui',
@@ -2994,10 +2996,41 @@
     );
   }
 
-  function openModal(
+  let modalBeforeClose =
+    null;
+
+  function setModalMode(
+    autoSave = false
+  ) {
+    const cancelButton =
+      $('#ch344-cancel');
+
+    const saveButton =
+      $('#ch344-save');
+
+    if (autoSave) {
+      cancelButton.style.setProperty(
+        'display',
+        'none',
+        'important'
+      );
+
+      saveButton.textContent =
+        '完成';
+
+    } else {
+      cancelButton.style.removeProperty(
+        'display'
+      );
+
+      saveButton.textContent =
+        '保存';
+    }
+  }
+
+  function showModal(
     name,
-    body,
-    onSave
+    body
   ) {
     modalTitle.textContent =
       name;
@@ -3009,13 +3042,27 @@
     modal.hidden =
       false;
 
-    // 弹窗打开后主动聚焦第一个编辑控件。
-    // 某些招聘网站会在点击后抢焦点，这里再补一次延迟聚焦。
     focusFirstModalControl();
 
     setTimeout(
       focusFirstModalControl,
       0
+    );
+  }
+
+  function openModal(
+    name,
+    body,
+    onSave
+  ) {
+    modalBeforeClose =
+      null;
+
+    setModalMode(false);
+
+    showModal(
+      name,
+      body
     );
 
     $('#ch344-save').onclick =
@@ -3032,12 +3079,139 @@
       };
   }
 
+  function openAutoEditModal(
+    name,
+    body,
+    onAutoSave,
+    undoLabel
+  ) {
+    let dirty =
+      false;
+
+    let timer =
+      null;
+
+    let lastSaveValid =
+      true;
+
+    const commit =
+      () => {
+        clearTimeout(
+          timer
+        );
+
+        timer =
+          null;
+
+        if (!dirty) {
+          return true;
+        }
+
+        const result =
+          onAutoSave();
+
+        lastSaveValid =
+          result !== false;
+
+        if (
+          lastSaveValid
+        ) {
+          saveDB();
+          saveUI();
+        }
+
+        return lastSaveValid;
+      };
+
+    const scheduleSave =
+      () => {
+        if (!dirty) {
+          pushUndo(
+            undoLabel
+          );
+
+          dirty =
+            true;
+        }
+
+        clearTimeout(
+          timer
+        );
+
+        timer =
+          setTimeout(
+            commit,
+            180
+          );
+      };
+
+    body.addEventListener(
+      'input',
+      scheduleSave
+    );
+
+    body.addEventListener(
+      'change',
+      scheduleSave
+    );
+
+    modalBeforeClose =
+      () => {
+        const wasDirty =
+          dirty;
+
+        const valid =
+          commit();
+
+        if (
+          wasDirty
+        ) {
+          render();
+
+          notify(
+            valid
+              ? '已自动保存'
+              : '有无效内容未保存'
+          );
+        }
+      };
+
+    setModalMode(true);
+
+    showModal(
+      name,
+      body
+    );
+
+    $('#ch344-save').onclick =
+      event => {
+        event.preventDefault();
+        event.stopPropagation();
+        closeModal();
+      };
+  }
+
   function closeModal() {
+    const beforeClose =
+      modalBeforeClose;
+
+    modalBeforeClose =
+      null;
+
+    if (
+      typeof beforeClose ===
+      'function'
+    ) {
+      beforeClose();
+    }
+
     modal.hidden =
       true;
 
     $('#ch344-save').onclick =
       null;
+
+    setModalMode(false);
   }
 
   $('#ch344-cancel').onclick =
@@ -3120,13 +3294,47 @@
       shortName.wrap
     );
 
+    const applyEdit =
+      () => {
+        const fullName =
+          name.element.value
+            .trim();
+
+        const short =
+          shortName.element.value
+            .trim();
+
+        if (!fullName) {
+          return false;
+        }
+
+        target.name =
+          fullName;
+
+        target.shortName =
+          short ||
+          fullName.slice(
+            0,
+            4
+          );
+
+        return true;
+      };
+
+    if (target) {
+      openAutoEditModal(
+        '编辑分类',
+        box,
+        applyEdit,
+        '编辑分类'
+      );
+
+      return;
+    }
+
     openModal(
-      target
-        ? '编辑分类'
-        : '新增分类',
-
+      '新增分类',
       box,
-
       () => {
         const fullName =
           name.element.value
@@ -3145,51 +3353,36 @@
         }
 
         pushUndo(
-          target
-            ? '编辑分类'
-            : '新增分类'
+          '新增分类'
         );
 
-        if (target) {
-          target.name =
-            fullName;
+        const category = {
+          id:
+            uid('cat'),
 
-          target.shortName =
+          name:
+            fullName,
+
+          shortName:
             short ||
             fullName.slice(
               0,
               4
-            );
+            ),
 
-        } else {
-          const category = {
-            id:
-              uid('cat'),
+          cards:
+            []
+        };
 
-            name:
-              fullName,
+        db.categories.push(
+          category
+        );
 
-            shortName:
-              short ||
-              fullName.slice(
-                0,
-                4
-              ),
+        state.categoryId =
+          category.id;
 
-            cards:
-              []
-          };
-
-          db.categories.push(
-            category
-          );
-
-          state.categoryId =
-            category.id;
-
-          state.cardId =
-            '';
-        }
+        state.cardId =
+          '';
 
         saveDB();
         saveUI();
@@ -3310,13 +3503,45 @@
       subtitleControl.wrap
     );
 
+    const applyEdit =
+      () => {
+        const cardTitle =
+          titleControl.element.value
+            .trim();
+
+        if (!cardTitle) {
+          return false;
+        }
+
+        target.title =
+          cardTitle;
+
+        target.shortName =
+          shortControl.element.value
+            .trim() ||
+          cardTitle;
+
+        target.subtitle =
+          subtitleControl.element.value
+            .trim();
+
+        return true;
+      };
+
+    if (target) {
+      openAutoEditModal(
+        '编辑卡片',
+        box,
+        applyEdit,
+        '编辑卡片'
+      );
+
+      return;
+    }
+
     openModal(
-      target
-        ? '编辑卡片'
-        : '新增卡片',
-
+      '新增卡片',
       box,
-
       () => {
         const cardTitle =
           titleControl.element.value
@@ -3331,52 +3556,40 @@
         }
 
         pushUndo(
-          target
-            ? '编辑卡片'
-            : '新增卡片'
+          '新增卡片'
         );
 
-        if (target) {
-          target.title =
-            cardTitle;
+        const card = {
+          id:
+            uid('card'),
 
-          target.shortName =
+          title:
+            cardTitle,
+
+          shortName:
             shortControl.element.value
               .trim() ||
-            cardTitle;
+            cardTitle,
 
-          target.subtitle =
+          subtitle:
             subtitleControl.element.value
-              .trim();
+              .trim(),
 
-        } else {
-          const card = {
-            id:
-              uid('card'),
+          items:
+            []
+        };
 
-            title:
-              cardTitle,
+        category.cards.push(
+          card
+        );
 
-            shortName:
-              shortControl.element.value
-                .trim() ||
-              cardTitle,
+        state.cardId =
+          card.id;
 
-            subtitle:
-              subtitleControl.element.value
-                .trim(),
-
-            items:
-              []
-          };
-
-          category.cards.push(
-            card
-          );
-
-          state.cardId =
-            card.id;
-        }
+        state.lastCardByCategory[
+          category.id
+        ] =
+          card.id;
 
         saveDB();
         saveUI();
@@ -3577,24 +3790,14 @@
 
     sync();
 
-    openModal(
-      target
-        ? '编辑字段'
-        : '新增字段',
-
-      box,
-
+    const buildItem =
       () => {
         const label =
           labelControl.element.value
             .trim();
 
         if (!label) {
-          alert(
-            '字段名称不能为空'
-          );
-
-          return false;
+          return null;
         }
 
         const item = {
@@ -3620,26 +3823,58 @@
             valueControl.element.value;
         }
 
-        pushUndo(
-          target
-            ? '编辑字段'
-            : '新增字段'
-        );
+        return item;
+      };
 
-        if (target) {
+    if (target) {
+      openAutoEditModal(
+        '编辑字段',
+        box,
+        () => {
+          const item =
+            buildItem();
+
+          if (!item) {
+            return false;
+          }
+
           card.items[
             index
           ] =
             item;
 
-        } else {
-          card.items.push(
-            item
+          return true;
+        },
+        '编辑字段'
+      );
+
+      return;
+    }
+
+    openModal(
+      '新增字段',
+      box,
+      () => {
+        const item =
+          buildItem();
+
+        if (!item) {
+          alert(
+            '字段名称不能为空'
           );
+
+          return false;
         }
 
-        saveDB();
+        pushUndo(
+          '新增字段'
+        );
 
+        card.items.push(
+          item
+        );
+
+        saveDB();
         render();
 
         return true;
@@ -4789,7 +5024,7 @@
         url;
 
       anchor.download =
-        `campus-helper-v346-${new Date()
+        `campus-helper-v351-${new Date()
           .toISOString()
           .slice(
             0,
@@ -4908,6 +5143,169 @@
         );
       }
     };
+
+  // =========================================================
+  // 拖动右侧单列分类栏
+  // 非管理模式下，按住分类栏任意位置都能移动整个助手。
+  // 使用移动阈值区分“点击分类”和“拖动窗口”。
+  // =========================================================
+
+  (() => {
+    let active =
+      false;
+
+    let moved =
+      false;
+
+    let suppressClick =
+      false;
+
+    let startX =
+      0;
+
+    let startY =
+      0;
+
+    let startLeft =
+      0;
+
+    let startTop =
+      0;
+
+    rail.addEventListener(
+      'pointerdown',
+      event => {
+        if (
+          state.manage ||
+          event.button !== 0
+        ) {
+          return;
+        }
+
+        active =
+          true;
+
+        moved =
+          false;
+
+        startX =
+          event.clientX;
+
+        startY =
+          event.clientY;
+
+        startLeft =
+          state.left;
+
+        startTop =
+          state.top;
+
+        rail.setPointerCapture?.(
+          event.pointerId
+        );
+      }
+    );
+
+    rail.addEventListener(
+      'pointermove',
+      event => {
+        if (!active) {
+          return;
+        }
+
+        const dx =
+          event.clientX -
+          startX;
+
+        const dy =
+          event.clientY -
+          startY;
+
+        if (
+          !moved &&
+          Math.hypot(
+            dx,
+            dy
+          ) < 6
+        ) {
+          return;
+        }
+
+        moved =
+          true;
+
+        state.left =
+          startLeft +
+          dx;
+
+        state.top =
+          startTop +
+          dy;
+
+        applyLayout();
+
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    );
+
+    const stopRailDrag =
+      event => {
+        if (!active) {
+          return;
+        }
+
+        active =
+          false;
+
+        if (!moved) {
+          return;
+        }
+
+        suppressClick =
+          true;
+
+        saveUI();
+
+        event?.preventDefault?.();
+        event?.stopPropagation?.();
+
+        setTimeout(
+          () => {
+            suppressClick =
+              false;
+          },
+          300
+        );
+      };
+
+    rail.addEventListener(
+      'pointerup',
+      stopRailDrag
+    );
+
+    rail.addEventListener(
+      'pointercancel',
+      stopRailDrag
+    );
+
+    rail.addEventListener(
+      'click',
+      event => {
+        if (!suppressClick) {
+          return;
+        }
+
+        suppressClick =
+          false;
+
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation?.();
+      },
+      true
+    );
+  })();
 
   // =========================================================
   // 拖动整个窗口
@@ -5296,7 +5694,7 @@
   );
 
   console.log(
-    '[秋招网申资料库 v3.4.6] 已启动'
+    '[秋招网申资料库 v3.5.1] 已启动'
   );
 
 })();
