@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         秋招网申资料库 v3.5.1
+// @name         秋招网申资料库 v3.5.2
 // @namespace    campus-application-helper
-// @version      3.5.1
-// @description  分类/卡片/字段三级自定义；侧栏也可拖动；编辑已有内容自动保存；支持 Ctrl/Cmd+Z 撤回、记住浏览位置、移动缩放、拖拽排序、JSON 导入导出。
+// @version      3.5.2
+// @description  分类/卡片/字段三级自定义；修复侧栏点击与拖动冲突；编辑已有内容自动保存；支持 Ctrl/Cmd+Z 撤回、记住浏览位置、移动缩放、拖拽排序、JSON 导入导出。
 // @match        http://*/*
 // @match        https://*/*
 // @run-at       document-end
@@ -15,10 +15,11 @@
 (function () {
   'use strict';
 
-  const ROOT = 'campus-helper-v351';
+  const ROOT = 'campus-helper-v352';
   const DB_KEY = 'campus-helper-v32-db';
-  const UI_KEY = 'campus-helper-v351-ui';
+  const UI_KEY = 'campus-helper-v352-ui';
   const OLD_UI_KEYS = [
+    'campus-helper-v351-ui',
     'campus-helper-v350-ui',
     'campus-helper-v346-ui',
     'campus-helper-v345-ui',
@@ -5146,8 +5147,8 @@
 
   // =========================================================
   // 拖动右侧单列分类栏
-  // 非管理模式下，按住分类栏任意位置都能移动整个助手。
-  // 使用移动阈值区分“点击分类”和“拖动窗口”。
+  // v3.5.2：点击与拖动分离。
+  // 普通点击不捕获指针；只有移动超过 6px 后才进入拖动态。
   // =========================================================
 
   (() => {
@@ -5159,6 +5160,9 @@
 
     let suppressClick =
       false;
+
+    let pointerId =
+      null;
 
     let startX =
       0;
@@ -5188,6 +5192,9 @@
         moved =
           false;
 
+        pointerId =
+          event.pointerId;
+
         startX =
           event.clientX;
 
@@ -5200,9 +5207,8 @@
         startTop =
           state.top;
 
-        rail.setPointerCapture?.(
-          event.pointerId
-        );
+        // 注意：这里不能立即 setPointerCapture。
+        // 否则普通点击可能无法正确落到分类按钮上。
       }
     );
 
@@ -5221,18 +5227,26 @@
           event.clientY -
           startY;
 
-        if (
-          !moved &&
-          Math.hypot(
-            dx,
-            dy
-          ) < 6
-        ) {
-          return;
-        }
+        if (!moved) {
+          if (
+            Math.hypot(
+              dx,
+              dy
+            ) < 6
+          ) {
+            return;
+          }
 
-        moved =
-          true;
+          moved =
+            true;
+
+          // 真正确认拖动后再捕获指针。
+          try {
+            rail.setPointerCapture?.(
+              event.pointerId
+            );
+          } catch (_) {}
+        }
 
         state.left =
           startLeft +
@@ -5255,10 +5269,20 @@
           return;
         }
 
+        const wasMoved =
+          moved;
+
         active =
           false;
 
-        if (!moved) {
+        moved =
+          false;
+
+        if (!wasMoved) {
+          // 普通点击：不拦截，不 preventDefault，
+          // 让按钮自己的 onclick 正常展开/切换。
+          pointerId =
+            null;
           return;
         }
 
@@ -5267,9 +5291,27 @@
 
         saveUI();
 
+        try {
+          if (
+            pointerId !== null &&
+            rail.hasPointerCapture?.(
+              pointerId
+            )
+          ) {
+            rail.releasePointerCapture?.(
+              pointerId
+            );
+          }
+        } catch (_) {}
+
+        pointerId =
+          null;
+
         event?.preventDefault?.();
         event?.stopPropagation?.();
 
+        // 拖动结束后浏览器可能继续派发一次 click，
+        // 只屏蔽这一次，避免拖完又误打开分类。
         setTimeout(
           () => {
             suppressClick =
@@ -5694,7 +5736,7 @@
   );
 
   console.log(
-    '[秋招网申资料库 v3.5.1] 已启动'
+    '[秋招网申资料库 v3.5.2] 已启动'
   );
 
 })();
