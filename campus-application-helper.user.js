@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         秋招网申助手 · 通用信息库（稳定版）
 // @namespace    https://github.com/local-only/campus-application-helper
-// @version      1.1.0
-// @description  跨网站手动填充本地信息库；收藏置顶、目标锁定、导入冲突预览和 JSON 备份，不自动提交。
+// @version      1.2.0
+// @description  跨网站手动填充本地信息库；按当前字段智能置顶、收藏、目标锁定、导入冲突预览和 JSON 备份，不自动提交。
 // @author       Local User
 // @match        http://*/*
 // @match        https://*/*
@@ -40,6 +40,8 @@
   let storageHealthy = true;
   let storageError = '';
   let selectedTarget = null;
+  let smartSortEnabled = true;
+  let fieldGuess = null;
   let editingId = null;
   let panelOpen = false;
   let dragging = null;
@@ -210,6 +212,13 @@
       .target-row { display: flex; align-items: center; gap: 6px; margin: 0 12px 10px; }
       .target-row .target { flex: 1 1 auto; min-width: 0; margin: 0; }
       .target-row .btn { flex: 0 0 auto; }
+      .smart-row { display: flex; align-items: center; gap: 7px; margin: -3px 12px 9px;
+        color: #475569; font-size: 11px; }
+      .smart-row label { display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto;
+        cursor: pointer; }
+      .smart-row input { margin: 0; accent-color: #155eef; }
+      .smart-hint { flex: 1; min-width: 0; color: #64748b; overflow-wrap: anywhere; }
+      .smart-tag { color: #1d4ed8; font-size: 11px; font-weight: 650; margin: 0 0 6px; }
       .btn.favorite { color: #a16207; }
       .entry.favorited { border-color: #f2d28b; background: #fffdf7; }
       #importView { overflow: auto; min-height: 0; flex: 1 1 auto; padding: 0 12px 12px; }
@@ -264,12 +273,18 @@
       title="秋招网申助手 · 点击展开 / 拖动位置">✎</button>
     <section id="panel" aria-label="秋招网申助手" hidden>
       <div class="top">
-        <div><div class="heading">秋招网申助手</div><div class="subheading">本地信息库 · 选择字段后手动填入 · v1.1</div></div>
+        <div><div class="heading">秋招网申助手</div><div class="subheading">本地信息库 · 选择字段后手动填入 · v1.2</div></div>
         <button type="button" class="icon-btn" id="closePanel" aria-label="收起面板" title="收起">×</button>
       </div>
       <div class="target-row">
         <div class="target" id="targetStatus" role="status">尚未选择网页输入框。先点击要填写的字段。</div>
         <button type="button" class="btn" id="clearTarget" title="主动取消已选中的网页字段">取消目标</button>
+      </div>
+      <div class="smart-row">
+        <label title="只根据当前输入框标签和字段说明调整信息库顺序，不会自动填写或上传内容">
+          <input type="checkbox" id="smartSort" checked /> 智能置顶
+        </label>
+        <span class="smart-hint" id="smartHint" aria-live="polite">选择网页字段后显示可能匹配的条目</span>
       </div>
       <div id="listView" style="display:flex;flex-direction:column;min-height:0;flex:1 1 auto;">
         <div class="toolbar">
@@ -341,15 +356,189 @@
     entryCategory.appendChild(createOption(category, category));
   }
 
+  // 规则匹配只读取用户主动选中的字段名称、提示和附近的小范围标题。
+  // 不读取字段已填写的 value，不扫描整张表单，不调用远端接口。
+  function cleanHint(text) {
+    return String(text || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+  }
+
+  function fieldMetadata(target) {
+    const strong = [];
+    const weak = [];
+    const add = (list, value) => {
+      const text = cleanHint(value);
+      if (text && !list.includes(text)) list.push(text);
+    };
+    if (target.labels) for (const label of [...target.labels].slice(0, 3)) add(strong, label.textContent);
+    const enclosingLabel = target.closest('label');
+    if (enclosingLabel) add(strong, enclosingLabel.textContent);
+    const labelledBy = cleanHint(target.getAttribute('aria-labelledby')).split(' ').slice(0, 3);
+    for (const id of labelledBy) {
+      const label = id && document.getElementById(id);
+      if (label) add(strong, label.textContent);
+    }
+    for (const key of ['aria-label', 'placeholder', 'title']) add(strong, target.getAttribute(key));
+    // 常见 Ant Design、Element UI 表单：只读本行标签，不读用户填过的字段。
+    for (let ancestor = target.parentElement, depth = 0; ancestor && depth < 4; ancestor = ancestor.parentElement, depth++) {
+      if (ancestor === document.body || ancestor === document.documentElement || ancestor === host) break;
+      const label = ancestor.querySelector('label, .ant-form-item-label, .el-form-item__label, .layui-form-label, .form-label');
+      if (label && label !== target && !label.contains(target)) {
+        add(strong, label.textContent);
+        break;
+      }
+    }
+    for (const key of ['name', 'id', 'data-field', 'data-name']) add(weak, target.getAttribute(key));
+    // 只读取附近容器的小标题 / fieldset legend；多条经历有同名字段时用来区分上下文。
+    const context = [];
+    for (let ancestor = target.parentElement, depth = 0; ancestor && depth < 6; ancestor = ancestor.parentElement, depth++) {
+      if (ancestor === document.body || ancestor === document.documentElement || ancestor === host) break;
+      const heading = ancestor.querySelector(':scope > legend, :scope > h2, :scope > h3, :scope > h4, :scope > header h2, :scope > header h3, :scope > .section-title, :scope > .ant-card-head .ant-card-head-title');
+      if (heading) add(context, heading.textContent);
+    }
+    return { primary: strong.join(' '), signals: strong, secondary: weak.join(' '), context: context.join(' ') };
+  }
+
+  const FIELD_RULES = [
+    { kind: '邮箱', match: /邮箱|电子邮箱|电子邮件|email|e-mail|mailaddress|电子信箱/i, category: '基本信息', title: /^邮箱/ },
+    { kind: '微信', match: /微信|wechat|weixin|wxid/i, category: '基本信息', title: /^微信号$/ },
+    { kind: 'GitHub', match: /github/i, category: '基本信息', title: /^GitHub/ },
+    { kind: '联系电话', match: /手机号|手机号码|联系电话|联系手机|手机|mobile|phone|tel(?:ephone)?/i, category: '基本信息', title: /^手机号$/ },
+    { kind: '出生日期', match: /出生日期|出生年月|生日|birth(?:day|date)|dateofbirth|dob/i, category: '基本信息', title: /^出生日期|^出生年月/ },
+    { kind: '性别', match: /性别|gender|sex/i, category: '基本信息', title: /^性别$/ },
+    { kind: '姓名', match: /姓名|中文名|full.?name|real.?name/i, category: '基本信息', title: /^姓名$/ },
+    { kind: '生源地', match: /生源地|户籍地|户口所在地|籍贯/i, category: '基本信息', title: /^生源地/ },
+    { kind: '婚姻状况', match: /婚姻|marital/i, category: '基本信息', title: /^婚姻状况$/ },
+    { kind: '自我评价', match: /自我评价|自我介绍|个人评价|个人优势|个人总结|自我描述|self.?evaluation|about.?me/i, category: '自我评价', title: /版|五个词|性格/ },
+    { kind: '获奖经历', match: /获奖|奖项|奖学金|荣誉|奖励|award|scholarship|honou?r/i, category: '获奖经历', title: /.+/ },
+    { kind: '毕业设计', match: /毕业设计|毕业论文|论文题目|研究课题|研究方向|论文名称|thesis/i, category: '毕业设计', title: /论文题目|研究内容/ },
+    { kind: '实习公司', match: /实习单位|实习公司|工作单位|公司名称|单位名称|雇主|employer|company/i, category: '实习经历', title: /公司名称|公司全称/ },
+    { kind: '项目名称', match: /项目名称|项目名|project.?name|project.?title/i, category: '项目经验', title: /项目名称$/ },
+    { kind: '项目角色', match: /项目角色|担任角色|项目职位|项目身份|project.?role/i, category: '项目经验', title: /项目角色/ },
+    { kind: '项目技术栈', match: /技术栈|项目技术|技术框架|tech.?stack/i, category: '项目经验', title: /技术栈/ },
+    { kind: '项目介绍', match: /项目介绍|项目描述|项目概述|项目内容|project.?description|project.?summary/i, category: '项目经验', title: /项目介绍|项目描述/ },
+    { kind: '项目职责', match: /项目职责|项目工作|项目成果|项目贡献|负责内容|project.?responsibilit/i, category: '项目经验', title: /项目职责|项目工作|工作内容|项目职责与成果/ },
+    { kind: '工作内容', match: /工作职责|岗位职责|实习内容|实习收获|工作内容|实践内容|主要职责|work.?description|responsibilit/i, category: '实习经历', title: /实习内容|岗位职责|经历概述/ },
+    { kind: '实习岗位', match: /实习岗位|职位名称|岗位名称|实习职位|工作岗位|job.?title|position/i, category: '实习经历', title: /实习岗位/ },
+    { kind: '实习部门', match: /实习部门|所在部门|部门名称|部门/i, category: '实习经历', title: /实习部门|部门$/ },
+    { kind: '学校', match: /毕业院校|就读学校|学校|院校名称|毕业学校|school|university|institution/i, category: '教育经历', title: /学校$/ },
+    { kind: '专业', match: /所学专业|专业名称|专业|major|speciali[sz]ation/i, category: '教育经历', title: /专业$/ },
+    { kind: '学院', match: /院系|学院|研究科|faculty|college|department/i, category: '教育经历', title: /学院|研究科/ },
+    { kind: '学历', match: /最高学历|学历|education.?level/i, category: '教育经历', title: /学历$/ },
+    { kind: '学位', match: /最高学位|学位|degree/i, category: '教育经历', title: /学位$/ },
+    { kind: '项目时间', match: /项目时间|项目起止|项目开始|项目结束|project.?date|project.?time/i, category: '项目经验', title: /项目时间|项目开始年月/ },
+    { kind: '技能', match: /专业技能|技术技能|计算机水平|技能特长|技能描述|skills|technical.?skills/i, category: '其他', title: /技能/ },
+    { kind: '英语', match: /英语|六级|cet.?6|english/i, category: '其他', title: /英语/ },
+    { kind: '日语', match: /日语|jlpt|japanese/i, category: '其他', title: /日语/ },
+    { kind: '工作城市', match: /意向工作地|期望工作地|工作地点|意向城市|期望城市|工作城市|work.?location/i, category: '求职意向', title: /工作城市|工作地点/ },
+    { kind: '求职岗位', match: /求职岗位|意向职位|应聘岗位|应聘职位|意向岗位|求职意向|job.?preference/i, category: '求职意向', title: /^求职岗位/ },
+    { kind: '现居城市', match: /现居住地|现居城市|当前居住城市|现居地|current.?city/i, category: '基本信息', title: /^现居城市$/ },
+    { kind: '实习时间', match: /实习时间|实习起止|实习开始|实习结束|入职日期|离职日期/i, category: '实习经历', title: /起止|开始日期|结束日期|起止月份/ },
+    { kind: '教育时间', match: /入学时间|毕业时间|入学日期|毕业日期|入学年份|毕业年份|就读时间|起止时间|start.?date|end.?date|graduation/i, category: '教育经历', title: /入学|毕业|就读|完整经历/ }
+  ];
+
+  const NO_SUGGESTION = /验证码|校验码|密码|证件号|身份证|银行卡|紧急联系人|家庭成员|家属|父亲|母亲|推荐人|联系人姓名|联系人电话|联系人.*(?:手机|电话|邮箱|email)|单位联系人|紧急联络人|政治面貌|民族|薪资|薪酬|工资|期望待遇/i;
+
+  function guessField(target) {
+    if (!isUsableTarget(target)) return null;
+    const meta = fieldMetadata(target);
+    const strong = meta.primary.toLowerCase();
+    const weak = meta.secondary.toLowerCase();
+    // 如果字段标签明确是他人联系方式、身份号等，不推荐自己的联系方式。
+    if (NO_SUGGESTION.test(strong)) return null;
+    const searchText = strong || weak;
+    if (!searchText) {
+      if (target instanceof HTMLInputElement && target.type === 'email') return { ...FIELD_RULES[0], context: meta.context, hint: '邮箱' };
+      if (target instanceof HTMLInputElement && target.type === 'tel') return { ...FIELD_RULES[3], context: meta.context, hint: '电话' };
+      return null;
+    }
+    // 显式 label 优先于 placeholder；避免“公司名称”的占位提示误把字段识别成“姓名”。
+    let rule = null;
+    for (const signal of meta.signals) {
+      rule = FIELD_RULES.find((item) => item.match.test(signal));
+      if (rule) break;
+    }
+    if (!rule && !NO_SUGGESTION.test(weak)) rule = FIELD_RULES.find((item) => item.match.test(weak));
+    if (!rule && target instanceof HTMLInputElement && target.type === 'email') rule = FIELD_RULES[0];
+    if (!rule && target instanceof HTMLInputElement && target.type === 'tel') rule = FIELD_RULES[3];
+    if (!rule) return null;
+    const combined = (meta.primary + ' ' + meta.context + ' ' + meta.secondary).toLowerCase();
+    // 通用“开始/结束日期”需先看局部区域语义，没有上下文就不猜。
+    if (rule.kind === '教育时间' && !/入学|毕业|就读|graduat/i.test(strong)) {
+      if (/实习|工作经历|任职|employment|work.?experience/i.test(meta.context + ' ' + strong)) rule = FIELD_RULES.find((item) => item.kind === '实习时间');
+      else if (/项目|project/i.test(meta.context + ' ' + strong)) rule = FIELD_RULES.find((item) => item.kind === '项目时间');
+      else if (!/教育|学校|学历|本科|硕士|education/i.test(meta.context + ' ' + strong)) return null;
+    }
+    const school = /硕士|研究生|master|graduate/i.test(combined) ? '硕士'
+      : /本科|学士|bachelor|undergraduate/i.test(combined) ? '本科'
+        : /高中|high.?school/i.test(combined) ? '高中' : '';
+    const company = /挚达|zhida/i.test(combined) ? '挚达科技'
+      : /联合汽车电子|uaes/i.test(combined) ? '联合汽车电子 UAES' : '';
+    const project = /deepresearch|research.?agent/i.test(combined) ? 'DeepResearch'
+      : /checklist/i.test(combined) ? 'CheckList'
+        : /prism/i.test(combined) ? 'PRISM'
+          : /机械臂|自动充电/i.test(combined) ? '自动充电机械臂碰撞检测与自恢复系统' : '';
+    const fieldText = (meta.primary || meta.secondary).toLowerCase();
+    const timeVariant = /开始|入学|start/i.test(fieldText) ? 'start'
+      : /结束|离职|毕业|end|graduat/i.test(fieldText) ? 'end'
+        : /年份|year/i.test(fieldText) ? 'year' : '';
+    return { ...rule, school, company, project, timeVariant, hint: cleanHint(meta.primary || meta.secondary || rule.kind) };
+  }
+
+  function matchingScore(entry, guess) {
+    if (!guess || entry.category !== guess.category || !guess.title.test(entry.title)) return 0;
+    const title = entry.title;
+    // 子字段（开始、结束、年份）只推荐对应条目，避免把入学日期推成毕业日期。
+    if (guess.kind === '教育时间' || guess.kind === '实习时间' || guess.kind === '项目时间') {
+      if (guess.timeVariant === 'start' && !/入学|开始/.test(title)) return 0;
+      if (guess.timeVariant === 'end' && !/毕业|结束/.test(title)) return 0;
+      if (guess.timeVariant === 'year' && !/年份/.test(title)) return 0;
+    }
+    if (guess.kind === '毕业设计') {
+      if (/题目|名称|thesis/i.test(guess.hint) && !/论文题目/.test(title)) return 0;
+      if (/内容|方向|研究|摘要/i.test(guess.hint) && !/研究内容/.test(title)) return 0;
+    }
+    if (guess.kind === 'GitHub' && /用户名|账号|user(name)?/i.test(guess.hint) && !/用户名/.test(title)) return 0;
+    let score = 100;
+    if (guess.school && (entry.category === '教育经历' || entry.category === '毕业设计')) {
+      if (!title.startsWith(guess.school + '｜')) return 0;
+      score += 35;
+    }
+    if (guess.company && entry.category === '实习经历') {
+      if (!title.startsWith(guess.company + '｜')) return 0;
+      score += 35;
+    }
+    if (guess.project && entry.category === '项目经验') {
+      if (!title.startsWith(guess.project + '｜')) return 0;
+      score += 35;
+    }
+    if (/YYYY-MM-DD|日期/.test(guess.hint) && /日期/.test(title)) score += 6;
+    if (/YYYY-MM|年月/.test(guess.hint) && /YYYY-MM|年月/.test(title)) score += 6;
+    if (/年份|year/i.test(guess.hint) && /年份/.test(title)) score += 8;
+    if (/简述|简要|简短|精简|200字|字以内/i.test(guess.hint) && /精简|简述/.test(title)) score += 7;
+    if (guess.kind === '学历' && /最高学历/.test(guess.hint) && /^最高学历$/.test(title)) score += 15;
+    if (guess.kind === '学位' && /最高学位/.test(guess.hint) && /^最高学位$/.test(title)) score += 15;
+    if (guess.kind === 'GitHub' && !/用户名|账号|user(name)?/i.test(guess.hint) && /主页/.test(title)) score += 10;
+    return score;
+  }
+
   function renderList() {
     entriesList.replaceChildren();
     const query = $('search').value.trim().toLocaleLowerCase();
     const category = categoryFilter.value;
+    const guess = smartSortEnabled ? fieldGuess : null;
+    const matches = new Map();
+    if (guess) for (const entry of entries) matches.set(entry.id, matchingScore(entry, guess));
     const shown = entries.filter((entry) => {
       if (category && entry.category !== category) return false;
       if (!query) return true;
       return `${entry.title}\n${entry.content}\n${entry.category}`.toLocaleLowerCase().includes(query);
-    }).sort((a, b) => Number(b.favorite) - Number(a.favorite) || b.updatedAt - a.updatedAt);
+    }).sort((a, b) => (matches.get(b.id) || 0) - (matches.get(a.id) || 0)
+      || Number(b.favorite) - Number(a.favorite) || b.updatedAt - a.updatedAt);
+    const suggestedCount = shown.filter((entry) => (matches.get(entry.id) || 0) > 0).length;
+    $('smartHint').textContent = !smartSortEnabled ? '已关闭，按收藏和时间排序'
+      : !fieldGuess ? '未识别字段，仍可手动搜索'
+        : suggestedCount ? `推测：${fieldGuess.kind} · 匹配 ${suggestedCount} 条（请核对）`
+          : `推测：${fieldGuess.kind}，当前筛选无匹配，试试搜索`;
 
     const fragment = document.createDocumentFragment();
     if (!shown.length) {
@@ -362,6 +551,13 @@
       const card = document.createElement('div');
       card.className = 'entry' + (entry.favorite ? ' favorited' : '');
       card.dataset.id = entry.id;
+      const score = matches.get(entry.id) || 0;
+      if (score > 0) {
+        const tag = document.createElement('div');
+        tag.className = 'smart-tag';
+        tag.textContent = '可能匹配当前字段 · 请核对内容';
+        card.appendChild(tag);
+      }
       const top = document.createElement('div');
       top.className = 'entry-top';
       const title = document.createElement('span');
@@ -429,13 +625,16 @@
     if (!isUsableTarget(target)) return '上次选择的字段已不可填写，请重新点击网页输入框。';
     const kind = target instanceof HTMLTextAreaElement ? '多行输入框'
       : target instanceof HTMLInputElement ? '输入框' : '富文本区域';
-    const hint = target.getAttribute('placeholder') || target.getAttribute('aria-label')
+    const hint = fieldGuess?.hint || target.getAttribute('placeholder') || target.getAttribute('aria-label')
       || target.getAttribute('name') || target.getAttribute('id') || '';
     return `当前目标：${kind}${hint ? ' · ' + hint.slice(0, 56) : ''}`;
   }
 
   function renderTarget() {
-    if (selectedTarget && !isUsableTarget(selectedTarget)) selectedTarget = null;
+    if (selectedTarget && !isUsableTarget(selectedTarget)) {
+      selectedTarget = null;
+      fieldGuess = null;
+    }
     const indicator = $('targetStatus');
     indicator.textContent = describeTarget(selectedTarget);
     indicator.classList.toggle('ready', isUsableTarget(selectedTarget));
@@ -452,20 +651,32 @@
     if (event.target === host || host.contains(event.target)) return;
     // 点到普通网页空白处时保留最近一次目标；新输入框将替换旧目标。
     // 点入 iframe 时清除旧目标，避免用户误以为选中了 iframe 内的字段。
-    if (event.target instanceof HTMLIFrameElement) selectedTarget = null;
-    else {
+    if (event.target instanceof HTMLIFrameElement) {
+      selectedTarget = null;
+      fieldGuess = null;
+    } else {
       const candidate = pageTargetFromEvent(event);
       if (!candidate) return;
+      if (selectedTarget === candidate && fieldGuess) return;
+      const changed = selectedTarget !== candidate;
       selectedTarget = candidate;
+      fieldGuess = guessField(candidate);
+      if (changed && smartSortEnabled && fieldGuess) {
+        $('search').value = '';
+        categoryFilter.value = '';
+      }
     }
     renderTarget();
+    renderList();
   }
   document.addEventListener('pointerdown', recordTarget, true);
   document.addEventListener('focusin', recordTarget, true);
   $('clearTarget').addEventListener('click', () => {
     selectedTarget = null;
+    fieldGuess = null;
     fillCheckToken++;
     renderTarget();
+    renderList();
     showStatus('已取消目标。下次填入前请重新点击网页字段。');
   });
 
@@ -938,6 +1149,7 @@
   });
 
   $('closePanel').addEventListener('click', () => togglePanel(false));
+  $('smartSort').addEventListener('change', (event) => { smartSortEnabled = event.target.checked; renderList(); });
   $('search').addEventListener('input', renderList);
   categoryFilter.addEventListener('change', renderList);
   $('addEntry').addEventListener('click', () => beginEdit());
