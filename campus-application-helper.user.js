@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         秋招网申助手 · 通用信息库
+// @name         秋招网申助手 · 通用信息库（稳定版）
 // @namespace    https://github.com/local-only/campus-application-helper
-// @version      1.0.0
-// @description  在不同网申网站手动选择和填入本地保存的常用信息；支持搜索、编辑、复制及 JSON 备份，不自动提交。
+// @version      1.1.0
+// @description  跨网站手动填充本地信息库；收藏置顶、目标锁定、导入冲突预览和 JSON 备份，不自动提交。
 // @author       Local User
 // @match        http://*/*
 // @match        https://*/*
@@ -34,6 +34,9 @@
   const SUPPORTED_INPUT_TYPES = new Set(['text', 'search', 'email', 'tel', 'url', 'number']);
 
   let entries = [];
+  let lastStoredRaw = null; // 乐观并发检查：跨标签页修改时不覆盖另一页的新数据。
+  let pendingImport = null;
+  let fillCheckToken = 0;
   let storageHealthy = true;
   let storageError = '';
   let selectedTarget = null;
@@ -85,7 +88,8 @@
       title: raw.title.trim(),
       content: raw.content,
       createdAt: safeNumber(raw.createdAt, now),
-      updatedAt: safeNumber(raw.updatedAt, now)
+      updatedAt: safeNumber(raw.updatedAt, now),
+      favorite: raw.favorite === true // v1.0 无此字段时默认为未收藏，保持旧数据可读。
     };
   }
 
@@ -109,6 +113,7 @@
 
   try {
     const raw = GM_getValue(STORAGE_KEY, null);
+    lastStoredRaw = raw === null ? null : typeof raw === 'string' ? raw : JSON.stringify(raw);
     if (raw !== null) {
       const decoded = typeof raw === 'string' ? JSON.parse(raw) : raw;
       entries = validateCollection(decoded);
@@ -137,9 +142,17 @@
 
   function persistEntries(nextEntries) {
     if (!storageHealthy) throw new Error('信息库读取异常，为防覆盖已禁用修改。');
+    const currentRaw = GM_getValue(STORAGE_KEY, null);
+    const currentSnapshot = currentRaw === null ? null
+      : typeof currentRaw === 'string' ? currentRaw : JSON.stringify(currentRaw);
+    if (currentSnapshot !== lastStoredRaw) {
+      throw new Error('其他标签页已修改信息库。为防覆盖，请刷新当前页后重试。');
+    }
     const checked = validateCollection(nextEntries);
     // 先写盘，再更新内存与界面；写盘失败时不制造“已保存”的假象。
-    GM_setValue(STORAGE_KEY, JSON.stringify(checked));
+    const serialized = JSON.stringify(checked);
+    GM_setValue(STORAGE_KEY, serialized);
+    lastStoredRaw = serialized;
     entries = checked;
   }
 
@@ -194,6 +207,17 @@
       .target { padding: 7px 10px; margin: 0 12px 10px; border-radius: 8px;
         background: #f1f5f9; color: #475569; overflow-wrap: anywhere; font-size: 12px; }
       .target.ready { background: #eaf8ef; color: #17633b; }
+      .target-row { display: flex; align-items: center; gap: 6px; margin: 0 12px 10px; }
+      .target-row .target { flex: 1 1 auto; min-width: 0; margin: 0; }
+      .target-row .btn { flex: 0 0 auto; }
+      .btn.favorite { color: #a16207; }
+      .entry.favorited { border-color: #f2d28b; background: #fffdf7; }
+      #importView { overflow: auto; min-height: 0; flex: 1 1 auto; padding: 0 12px 12px; }
+      .import-summary { font-size: 12px; color: #475569; white-space: pre-wrap; margin-bottom: 10px; }
+      .import-row { padding: 8px; margin-bottom: 8px; border: 1px solid #e2e8f0; border-radius: 8px; }
+      .import-compare { font-size: 11px; color: #475569; overflow-wrap: anywhere; white-space: pre-wrap; }
+      .import-row select { margin-top: 6px; }
+      .import-actions { display: flex; gap: 6px; justify-content: flex-end; }
       .toolbar { display: grid; grid-template-columns: 1fr 1fr auto; gap: 6px;
         padding: 0 12px 9px; }
       .control { min-width: 0; width: 100%; padding: 7px 8px; border: 1px solid #cbd5e1;
@@ -240,10 +264,13 @@
       title="秋招网申助手 · 点击展开 / 拖动位置">✎</button>
     <section id="panel" aria-label="秋招网申助手" hidden>
       <div class="top">
-        <div><div class="heading">秋招网申助手</div><div class="subheading">本地信息库 · 点击条目手动填入</div></div>
+        <div><div class="heading">秋招网申助手</div><div class="subheading">本地信息库 · 选择字段后手动填入 · v1.1</div></div>
         <button type="button" class="icon-btn" id="closePanel" aria-label="收起面板" title="收起">×</button>
       </div>
-      <div class="target" id="targetStatus">尚未选择网页输入框。先点击要填写的字段。</div>
+      <div class="target-row">
+        <div class="target" id="targetStatus" role="status">尚未选择网页输入框。先点击要填写的字段。</div>
+        <button type="button" class="btn" id="clearTarget" title="主动取消已选中的网页字段">取消目标</button>
+      </div>
       <div id="listView" style="display:flex;flex-direction:column;min-height:0;flex:1 1 auto;">
         <div class="toolbar">
           <input class="control" id="search" type="search" placeholder="搜索标题或内容" aria-label="搜索信息" />
@@ -264,6 +291,15 @@
           <button type="submit" class="btn primary" id="saveEntry">保存</button>
         </div>
       </form>
+      <section id="importView" hidden aria-label="JSON 导入预览">
+        <div class="editor-title">导入预览 · 先确认再写入</div>
+        <div class="import-summary" id="importSummary"></div>
+        <div id="importConflicts"></div>
+        <div class="import-actions">
+          <button type="button" class="btn" id="cancelImport">取消导入</button>
+          <button type="button" class="btn primary" id="applyImport">确认导入</button>
+        </div>
+      </section>
       <div class="footer">
         <div class="footer-buttons">
           <button type="button" class="btn" id="exportJson">导出 JSON</button>
@@ -282,6 +318,7 @@
   const listView = $('listView');
   const entriesList = $('entriesList');
   const editorView = $('editorView');
+  const importView = $('importView');
   const categoryFilter = $('filterCategory');
   const entryCategory = $('entryCategory');
 
@@ -312,7 +349,7 @@
       if (category && entry.category !== category) return false;
       if (!query) return true;
       return `${entry.title}\n${entry.content}\n${entry.category}`.toLocaleLowerCase().includes(query);
-    }).sort((a, b) => b.updatedAt - a.updatedAt);
+    }).sort((a, b) => Number(b.favorite) - Number(a.favorite) || b.updatedAt - a.updatedAt);
 
     const fragment = document.createDocumentFragment();
     if (!shown.length) {
@@ -323,7 +360,7 @@
     }
     for (const entry of shown) {
       const card = document.createElement('div');
-      card.className = 'entry';
+      card.className = 'entry' + (entry.favorite ? ' favorited' : '');
       card.dataset.id = entry.id;
       const top = document.createElement('div');
       top.className = 'entry-top';
@@ -341,14 +378,17 @@
       actions.className = 'actions';
       for (const [action, label, primary] of [
         ['fill', '填入', true], ['copy', '复制', false],
+        ['favorite', entry.favorite ? '★ 已收藏' : '☆ 收藏', false],
         ['edit', '编辑', false], ['delete', '删除', false]
       ]) {
         const button = document.createElement('button');
         button.type = 'button';
         button.dataset.action = action;
-        button.className = 'btn' + (primary ? ' primary' : '') + (action === 'delete' ? ' danger' : '');
+        button.className = 'btn' + (primary ? ' primary' : '')
+          + (action === 'delete' ? ' danger' : '') + (action === 'favorite' ? ' favorite' : '');
+        if (action === 'favorite') button.setAttribute('aria-pressed', String(entry.favorite));
         button.textContent = label;
-        if (!storageHealthy && (action === 'edit' || action === 'delete')) button.disabled = true;
+        if (!storageHealthy && (action === 'edit' || action === 'delete' || action === 'favorite')) button.disabled = true;
         actions.appendChild(button);
       }
       card.append(top, preview, actions);
@@ -379,6 +419,7 @@
       if (target.disabled || target.readOnly) return false;
     } else if (!target.isContentEditable) return false;
     if (target.getClientRects().length === 0) return false;
+    if (target.closest('[inert]')) return false;
     const style = window.getComputedStyle(target);
     return style.visibility !== 'hidden' && style.visibility !== 'collapse';
   }
@@ -394,9 +435,11 @@
   }
 
   function renderTarget() {
+    if (selectedTarget && !isUsableTarget(selectedTarget)) selectedTarget = null;
     const indicator = $('targetStatus');
     indicator.textContent = describeTarget(selectedTarget);
     indicator.classList.toggle('ready', isUsableTarget(selectedTarget));
+    $('clearTarget').disabled = !selectedTarget;
   }
 
   function pageTargetFromEvent(event) {
@@ -405,16 +448,26 @@
   }
 
   // 只记住用户亲自点选或聚焦的网页字段；不会扫描表单或自动猜测字段含义。
-  document.addEventListener('pointerdown', (event) => {
+  function recordTarget(event) {
     if (event.target === host || host.contains(event.target)) return;
-    selectedTarget = pageTargetFromEvent(event);
+    // 点到普通网页空白处时保留最近一次目标；新输入框将替换旧目标。
+    // 点入 iframe 时清除旧目标，避免用户误以为选中了 iframe 内的字段。
+    if (event.target instanceof HTMLIFrameElement) selectedTarget = null;
+    else {
+      const candidate = pageTargetFromEvent(event);
+      if (!candidate) return;
+      selectedTarget = candidate;
+    }
     renderTarget();
-  }, true);
-  document.addEventListener('focusin', (event) => {
-    if (event.target === host || host.contains(event.target)) return;
-    selectedTarget = pageTargetFromEvent(event);
+  }
+  document.addEventListener('pointerdown', recordTarget, true);
+  document.addEventListener('focusin', recordTarget, true);
+  $('clearTarget').addEventListener('click', () => {
+    selectedTarget = null;
+    fillCheckToken++;
     renderTarget();
-  }, true);
+    showStatus('已取消目标。下次填入前请重新点击网页字段。');
+  });
 
   function nativeSetValue(target, value) {
     const prototype = target instanceof HTMLTextAreaElement
@@ -434,6 +487,10 @@
     if (target.value !== value) {
       throw new Error('页面没有接受该值，请检查字段格式或使用「复制」手动粘贴。');
     }
+    if (target.validity && (target.validity.typeMismatch || target.validity.patternMismatch
+      || target.validity.rangeOverflow || target.validity.rangeUnderflow || target.validity.stepMismatch)) {
+      return '网页提示字段格式、范围或步长不符，请检查后再提交。';
+    }
     try {
       if (typeof target.setSelectionRange === 'function' && target.type !== 'number') {
         target.setSelectionRange(value.length, value.length);
@@ -442,20 +499,19 @@
   }
 
   function fillRichText(target, value) {
+    // 只尝试真正空白且没有子元素的简单 contenteditable。
+    // Quill/TinyMCE/ProseMirror 等通常包含结构化节点，统一要求复制后人工粘贴。
+    if (target.textContent.length > 0 || target.querySelector('*')) {
+      throw new Error('此富文本区域已有内容或排版结构；为了保护原文和格式，请使用「复制」后手动粘贴。');
+    }
     if (typeof document.execCommand !== 'function') {
-      throw new Error('此富文本编辑器不支持通用填充，请使用「复制」后手动粘贴。');
+      throw new Error('此富文本编辑器不支持通用填充，请使用「复制」手动粘贴。');
     }
     target.focus({ preventScroll: true });
-    const selection = window.getSelection();
-    if (!selection) throw new Error('无法访问富文本编辑区的光标，请手动粘贴。');
-    const range = document.createRange();
-    range.selectNodeContents(target);
-    selection.removeAllRanges();
-    selection.addRange(range);
-    // 浏览器编辑命令比直接改 innerHTML/textContent 更容易通知富文本框架。
-    // 如果命令不受支持，宁可要求用户复制粘贴，也不强制篡改编辑器 DOM。
     const inserted = document.execCommand('insertText', false, value);
-    if (!inserted) throw new Error('该富文本编辑器未接受填充，请使用「复制」后手动粘贴。');
+    if (!inserted || target.textContent !== value) {
+      throw new Error('富文本未确认完整插入，请检查编辑器，必要时手动复制粘贴。');
+    }
   }
 
   function fillEntry(entry) {
@@ -478,8 +534,12 @@
         return;
       }
     }
-    const existing = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement
-      ? target.value : target.textContent;
+    const isTextControl = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement;
+    const existing = isTextControl ? target.value : target.textContent;
+    if (!isTextControl && (existing.length > 0 || target.querySelector('*'))) {
+      showStatus('富文本已有内容或结构。为保护格式，不自动覆盖；请点击「复制」手动粘贴。', 'error');
+      return;
+    }
     if (existing === value) {
       showStatus('目标字段已经是相同内容，未重复修改。', 'success');
       return;
@@ -492,13 +552,26 @@
     }
     try {
       if (!isUsableTarget(target)) throw new Error('目标字段已不可填写，请重新选择。');
-      if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
-        nativeSetValue(target, value);
+      if (isTextControl) {
+        const warning = nativeSetValue(target, value);
         target.focus({ preventScroll: true });
+        showStatus(warning || '已触发填入，正在复核网页字段。请自行检查并提交网申。', warning ? 'error' : 'success');
+        const token = ++fillCheckToken;
+        window.setTimeout(() => {
+          if (token !== fillCheckToken || selectedTarget !== target) return;
+          if (!isUsableTarget(target)) {
+            showStatus('原网页字段已失效或被重新渲染，请重新选择输入框并核对内容。', 'error');
+          } else if (target.value !== value) {
+            showStatus('复核发现网页恢复或改写了内容；此字段可能不兼容，请使用「复制」手动粘贴。', 'error');
+          } else if (!warning) {
+            showStatus('复核通过：网页字段仍显示填入内容。请检查校验提示；不代表网申已保存或提交。', 'success');
+          }
+          renderTarget();
+        }, 300);
       } else {
         fillRichText(target, value);
+        showStatus('已尝试写入简单空白富文本区。请检查编辑器并自行提交。', 'success');
       }
-      showStatus('已尝试填入。请检查网页显示和字段校验，再自行提交网申。', 'success');
       renderTarget();
     } catch (error) {
       showStatus(error instanceof Error ? error.message : '填充失败，请复制后手动粘贴。', 'error');
@@ -577,7 +650,8 @@
       title,
       content,
       createdAt: previous ? previous.createdAt : now,
-      updatedAt: now
+      updatedAt: now,
+      favorite: previous ? previous.favorite : false
     };
     try {
       const next = previous ? entries.map((entry) => entry.id === previous.id ? record : entry)
@@ -587,6 +661,18 @@
       showStatus(previous ? '编辑内容已保存到本地信息库。' : '新增内容已保存到本地信息库。', 'success');
     } catch (error) {
       showStatus(`保存失败：${error instanceof Error ? error.message : String(error)}`, 'error');
+    }
+  }
+
+  function toggleFavorite(entry) {
+    if (!storageHealthy) return showStatus('信息库读取异常，不能修改收藏状态。', 'error');
+    try {
+      persistEntries(entries.map((item) => item.id === entry.id
+        ? { ...item, favorite: !item.favorite } : item));
+      renderList();
+      showStatus(entry.favorite ? '已取消收藏。' : '已收藏并置顶。', 'success');
+    } catch (error) {
+      showStatus(`收藏失败：${error instanceof Error ? error.message : String(error)}`, 'error');
     }
   }
 
@@ -627,6 +713,86 @@
     }
   }
 
+  function entryKey(item) { return JSON.stringify([item.category, item.title]); }
+  function entrySignature(item) { return JSON.stringify([item.category, item.title, item.content]); }
+
+  function planBackup(incoming) {
+    const currentById = new Map(entries.map((item) => [item.id, item]));
+    const byTitle = new Map();
+    for (const item of entries) {
+      const key = entryKey(item);
+      byTitle.set(key, [...(byTitle.get(key) || []), item]);
+    }
+    const knownExact = new Set(entries.map(entrySignature));
+    const importedTitles = new Map();
+    const additions = [], conflicts = [];
+    let skipped = 0;
+    for (const item of incoming) {
+      const key = entryKey(item);
+      const previousIncoming = importedTitles.get(key);
+      if (previousIncoming && previousIncoming !== entrySignature(item)) {
+        throw new Error(`备份内部的「${item.title}」存在同类别同标题、正文不同的多条信息，请先整理备份再导入。`);
+      }
+      importedTitles.set(key, entrySignature(item));
+      if (knownExact.has(entrySignature(item))) { skipped++; continue; }
+      const matchById = currentById.get(item.id);
+      const titleMatches = byTitle.get(key) || [];
+      if (!matchById && titleMatches.length > 1) {
+        throw new Error(`当前信息库中「${item.title}」存在多条同类别同标题记录，请先区分标题再导入。`);
+      }
+      const matched = matchById || titleMatches[0];
+      if (matched) {
+        conflicts.push({ incoming: item, existing: matched });
+        knownExact.add(entrySignature(item)); // 避免同一备份中重复展示相同冲突。
+      } else {
+        additions.push(item);
+        knownExact.add(entrySignature(item));
+      }
+    }
+    return { additions, conflicts, skipped };
+  }
+
+  function closeImport() {
+    pendingImport = null;
+    importView.hidden = true;
+    listView.hidden = false;
+    $('importConflicts').replaceChildren();
+    renderList();
+    positionPanel();
+  }
+
+  function previewImport(fileName, plan) {
+    listView.hidden = true;
+    editorView.hidden = true;
+    importView.hidden = false;
+    $('importSummary').textContent = `文件：${fileName}\n预计新增 ${plan.additions.length} 条；` +
+      `存在 ${plan.conflicts.length} 处冲突；跳过完全重复 ${plan.skipped} 条。\n` +
+      '冲突默认保留当前信息；只有你主动选择“使用备份版本”，才会替换对应条目。';
+    const container = $('importConflicts');
+    container.replaceChildren();
+    const fragment = document.createDocumentFragment();
+    for (const [index, conflict] of plan.conflicts.entries()) {
+      const row = document.createElement('div');
+      row.className = 'import-row';
+      const heading = document.createElement('div');
+      heading.className = 'entry-title';
+      heading.textContent = `${index + 1}. ${conflict.incoming.category} / ${conflict.incoming.title}`;
+      const compare = document.createElement('div');
+      compare.className = 'import-compare';
+      const shorten = (content) => content.length > 80 ? content.slice(0, 80) + '…' : content;
+      compare.textContent = `当前：${shorten(conflict.existing.content)}\n备份：${shorten(conflict.incoming.content)}`;
+      const select = document.createElement('select');
+      select.className = 'control';
+      select.dataset.conflictIndex = String(index);
+      select.setAttribute('aria-label', `处理冲突 ${conflict.incoming.title}`);
+      select.append(createOption('keep', '保留当前版本（默认）'), createOption('replace', '使用备份版本覆盖此条'));
+      row.append(heading, compare, select);
+      fragment.appendChild(row);
+    }
+    container.appendChild(fragment);
+    positionPanel();
+  }
+
   async function importBackup(file) {
     if (!file || !storageHealthy) return;
     if (file.size > MAX_IMPORT_BYTES) {
@@ -637,40 +803,68 @@
       const raw = JSON.parse(await file.text());
       if (!raw || typeof raw !== 'object' || Array.isArray(raw)
         || raw.schema !== SCHEMA || raw.version !== SCHEMA_VERSION) {
-        throw new Error('不是本助手 v1 格式的 JSON 备份。');
+        throw new Error('不是本助手 v1 兼容格式的 JSON 备份。');
       }
       const incoming = validateCollection(raw.entries);
-      const existingSignatures = new Set(entries.map((item) =>
-        JSON.stringify([item.category, item.title, item.content])));
+      const plan = planBackup(incoming);
+      if (!plan.additions.length && !plan.conflicts.length) {
+        showStatus('此备份中的记录已经存在，没有需要导入的内容。');
+        return;
+      }
+      // 预览不写盘；保存用于提交前再次检查当前数据是否变化。
+      pendingImport = { plan, snapshot: lastStoredRaw };
+      previewImport(file.name, plan);
+      showStatus('请查看导入预览并选择每条冲突的处理方式。');
+    } catch (error) {
+      showStatus(`无法预览导入，信息库未改变：${error instanceof Error ? error.message : String(error)}`, 'error');
+    }
+  }
+
+  function applyImport() {
+    if (!pendingImport || !storageHealthy) return;
+    try {
+      if (pendingImport.snapshot !== lastStoredRaw) {
+        throw new Error('信息库已发生变化，请取消并重新选择备份文件。');
+      }
+      const { additions, conflicts, skipped } = pendingImport.plan;
+      const choices = [...$('importConflicts').querySelectorAll('select[data-conflict-index]')];
+      const replacements = new Map();
+      for (const select of choices) {
+        if (select.value !== 'replace') continue;
+        const conflict = conflicts[Number(select.dataset.conflictIndex)];
+        if (!conflict) throw new Error('导入预览已失效，请重新选择备份。');
+        const original = entries.find((item) => item.id === conflict.existing.id);
+        if (!original) throw new Error('待替换信息已不存在，请重新选择备份。');
+        if (replacements.has(original.id)) throw new Error('同一信息发生多次冲突，请先整理备份。');
+        replacements.set(original.id, {
+          ...conflict.incoming, id: original.id, createdAt: original.createdAt,
+          favorite: original.favorite, updatedAt: Date.now()
+        });
+      }
+      if (!additions.length && !replacements.size) {
+        closeImport();
+        showStatus(`没有选择新增或覆盖操作；已保留原信息，跳过 ${skipped + conflicts.length} 条。`);
+        return;
+      }
       const occupiedIds = new Set(entries.map((item) => item.id));
-      const additions = [];
-      for (const item of incoming) {
-        const signature = JSON.stringify([item.category, item.title, item.content]);
-        if (existingSignatures.has(signature)) continue;
-        existingSignatures.add(signature);
+      const safeAdditions = additions.map((item) => {
         const fresh = { ...item };
         while (occupiedIds.has(fresh.id)) fresh.id = newId();
         occupiedIds.add(fresh.id);
-        additions.push(fresh);
-      }
-      if (!additions.length) {
-        showStatus('备份条目与信息库内容相同，没有需要新增的记录。');
-        return;
-      }
-      // 合并导入，不覆盖、不删除现有信息；即使 ID 冲突也生成新 ID。
-      const next = validateCollection([...entries, ...additions]);
-      if (!window.confirm(
-        `将从「${file.name}」新增 ${additions.length} 条信息，跳过 ${incoming.length - additions.length} 条重复内容。\n\n` +
-        `原有 ${entries.length} 条不会被覆盖或删除。确定导入吗？`
-      )) {
-        showStatus('已取消导入，原有信息未更改。');
+        return fresh;
+      });
+      const next = validateCollection([
+        ...entries.map((item) => replacements.get(item.id) || item), ...safeAdditions
+      ]);
+      if (!window.confirm(`准备新增 ${safeAdditions.length} 条、覆盖 ${replacements.size} 条、保留或跳过 ${skipped + conflicts.length - replacements.size} 条。\n\n确定写入本地信息库吗？`)) {
+        showStatus('已取消本次写入，信息库没有改变。');
         return;
       }
       persistEntries(next);
-      renderList();
-      showStatus(`导入完成：新增 ${additions.length} 条，跳过 ${incoming.length - additions.length} 条重复内容。`, 'success');
+      closeImport();
+      showStatus(`导入成功：新增 ${safeAdditions.length} 条，覆盖 ${replacements.size} 条。请按需导出新备份。`, 'success');
     } catch (error) {
-      showStatus(`导入失败，未修改原有数据：${error instanceof Error ? error.message : String(error)}`, 'error');
+      showStatus(`导入未完成：${error instanceof Error ? error.message : String(error)}`, 'error');
     }
   }
 
@@ -751,6 +945,8 @@
   editorView.addEventListener('submit', saveEdit);
   $('exportJson').addEventListener('click', downloadBackup);
   $('importJson').addEventListener('click', () => $('jsonFile').click());
+  $('cancelImport').addEventListener('click', () => { closeImport(); showStatus('已取消导入，原有信息未修改。'); });
+  $('applyImport').addEventListener('click', applyImport);
   $('jsonFile').addEventListener('change', async (event) => {
     const file = event.target.files && event.target.files[0];
     event.target.value = ''; // 允许连续导入同一个备份文件。
@@ -765,6 +961,7 @@
     switch (button.dataset.action) {
       case 'fill': fillEntry(entry); break;
       case 'copy': void copyEntry(entry); break;
+      case 'favorite': toggleFavorite(entry); break;
       case 'edit': beginEdit(entry); break;
       case 'delete': deleteEntry(entry); break;
       default: break;
@@ -773,6 +970,7 @@
   shadow.addEventListener('keydown', (event) => {
     if (event.key !== 'Escape') return;
     if (!editorView.hidden) cancelEdit();
+    else if (!importView.hidden) closeImport();
     else if (panelOpen) togglePanel(false);
     else return;
     event.stopPropagation();
