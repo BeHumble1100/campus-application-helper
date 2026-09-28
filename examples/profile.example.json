@@ -1,0 +1,15 @@
+{
+  "basic": {
+    "name": "张三",
+    "phone": "13800000000",
+    "email": "example@example.com",
+    "city": "示例市"
+  },
+  "education": [
+    {
+      "school": "示例大学",
+      "major": "示例专业",
+      "period": "2024-09 至 2027-06"
+    }
+  ]
+}

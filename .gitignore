@@ -1,0 +1,19 @@
+# Private reconstruction material and personal data
+data/
+source/
+versions/
+*.zip
+*.log
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Dependencies and local caches
+node_modules/
+coverage/
+.cache/
+tmp/
+temp/
